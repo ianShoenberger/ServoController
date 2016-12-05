@@ -43,7 +43,7 @@ void* generate_output(void* args) {
 	Servo *servo = (Servo *)args;
 
 	while(1) {
-		pthread_mutex_lock(&servo->wave_mutex);
+		//pthread_mutex_lock(&servo->wave_mutex);
 		out8(servo->data_handle, HIGH);
 		//printf("HIGH\n");
 		nanosleep(&servo->duty_cycle, NULL);
@@ -51,7 +51,7 @@ void* generate_output(void* args) {
 		//printf("LOW\n");
 		//printf("servo pos: %d\n", servo->position);
 		nanosleep(&servo->low_interval, NULL);
-		pthread_mutex_unlock(&servo->wave_mutex);
+		//pthread_mutex_unlock(&servo->wave_mutex);
 	}
 
 	return NULL;
@@ -59,6 +59,8 @@ void* generate_output(void* args) {
 
 void* read_recipe(void* args) {
 	char recipe[] = {MOV+0,MOV+5,MOV+0,MOV+3,LOOP_START+0,MOV+1,MOV+4,END_LOOP,MOV+0,MOV+2,WAIT+0,MOV+3,WAIT+0,MOV+2,MOV+3,WAIT+31,WAIT+31,WAIT+31,MOV+4};
+	//char recipe[] = {LOOP_START+2, MOV+5, MOV+0, END_LOOP, MOV+3};
+	int recipe_len = sizeof(recipe)/sizeof(recipe[0]);
 	Servo *servo = (Servo *)args;
 	int opcode = 0;
 	int opcode_argument = 0;
@@ -73,63 +75,69 @@ void* read_recipe(void* args) {
 	while(1)
 	{
 		// better to lock the cursor so that we dont end up with a command with the wrong paired value!
-		pthread_mutex_lock(&servo->cursor_mutex);
-		tmp_cursor = servo->recipe_cursor;
-		pthread_mutex_unlock(&servo->cursor_mutex);
-
-		// mask the element to get the opcode - the top 3 bits
-		opcode = recipe[tmp_cursor] & op_mask;
-		opcode_argument = recipe[tmp_cursor] & op_arg_mask;
-
-		switch(opcode)
+		if(!servo->paused)
 		{
-		case MOV:
-			printf("Mov: %d\n", opcode_argument);
-			set_pwm(servo, opcode_argument);
-			// add wait time here
-			break;
-		case WAIT:
-			printf("Wait: %d\n", opcode_argument);
-			// increase by 1 - requirements say the value will always be 1/10 more than what is specified
-			opcode_argument++;
-			servo_wait_period.tv_sec = opcode_argument / 10;
-			servo_wait_period.tv_nsec = (opcode_argument % 10) * 100000000;
-			nanosleep(&servo_wait_period, NULL);
-			break;
-		case LOOP_START:
-			printf("Loop_Start: %d\n", opcode_argument);
-			// set loop counter only if this is first time through
-			if(servo->loop_ctr == 0)
+			//pthread_mutex_lock(&servo->cursor_mutex);
+			tmp_cursor = servo->recipe_cursor;
+			//pthread_mutex_unlock(&servo->cursor_mutex);
+
+			// keep the thread active if we have finished the recipe and it was not ended with a END_RECIPE command.
+			if(tmp_cursor >= recipe_len)
+				continue;
+
+			// mask the element to get the opcode - the top 3 bits
+			opcode = recipe[tmp_cursor] & op_mask;
+			opcode_argument = recipe[tmp_cursor] & op_arg_mask;
+
+			switch(opcode)
 			{
-				servo->loop_ctr = opcode_argument;
-			}
-			break;
-		case END_LOOP:
-			printf("End_Loop\n");
-			if(servo->loop_ctr > 0)
-			{
-				servo->loop_ctr--;
-				// rewind loop till we get to first LOOP_START
-				while(opcode != LOOP_START)
+			case MOV:
+				//printf("Mov: %d\n", opcode_argument);
+				set_pwm(servo, opcode_argument);
+				break;
+			case WAIT:
+				//printf("Wait: %d\n", opcode_argument);
+				// increase by 1 - requirements say the value will always be 1/10 more than what is specified
+				opcode_argument++;
+				servo_wait_period.tv_sec = opcode_argument / 10;
+				servo_wait_period.tv_nsec = (opcode_argument % 10) * 100000000;
+				nanosleep(&servo_wait_period, NULL);
+				break;
+			case LOOP_START:
+				//printf("Loop_Start: %d\n", opcode_argument);
+				// set loop counter only if this is first time through
+				if(servo->loop_ctr == 0)
 				{
-					tmp_cursor--;
-					opcode = recipe[tmp_cursor];
+					servo->loop_ctr = opcode_argument;
 				}
-				pthread_mutex_lock(&servo->cursor_mutex);
-				servo->recipe_cursor = tmp_cursor;
-				pthread_mutex_unlock(&servo->cursor_mutex);
+				break;
+			case END_LOOP:
+				//printf("End_Loop\n");
+				if(servo->loop_ctr > 0)
+				{
+					servo->loop_ctr--;
+					// rewind loop till we get to first LOOP_START
+					while(opcode != LOOP_START)
+					{
+						tmp_cursor--;
+						opcode = recipe[tmp_cursor] & op_mask;
+					}
+					pthread_mutex_lock(&servo->cursor_mutex);
+					servo->recipe_cursor = tmp_cursor;
+					pthread_mutex_unlock(&servo->cursor_mutex);
 
+				}
+				break;
+			case RECIPE_END:
+				return;
 			}
-			break;
-		case RECIPE_END:
-			break;
-		}
 
-		if(opcode != RECIPE_END)
-		{
-			pthread_mutex_lock(&servo->cursor_mutex);
-			servo->recipe_cursor += 1;
-			pthread_mutex_unlock(&servo->cursor_mutex);
+			if(opcode != RECIPE_END)
+			{
+				pthread_mutex_lock(&servo->cursor_mutex);
+				servo->recipe_cursor += 1;
+				pthread_mutex_unlock(&servo->cursor_mutex);
+			}
 		}
 	}
 
@@ -182,35 +190,32 @@ int main(int argc, char *argv[]) {
 				switch(temp_override_cmd)
 				{
 				case 'p':
-					printf("user paused recipe\n");
-					// paused <=1;
-
+					servoArray[cmd_iterator]->paused = 1;
 					break;
 				case 'c':
-					printf("user continued recipe\n");
-					// paused <= 0;
+					servoArray[cmd_iterator]->paused = 0;
 					break;
 				case 'r':
-					if(servoArray[cmd_iterator]->position > 0)
+					if(servoArray[cmd_iterator]->position > 0 && servoArray[cmd_iterator]->paused)
 					{
 						new_servo_pos = servoArray[cmd_iterator]->position - 1;
 						set_pwm(servoArray[cmd_iterator], new_servo_pos);
 					}
 					break;
 				case 'l':
-					if(servoArray[cmd_iterator]->position < 5)
+					if(servoArray[cmd_iterator]->position < 5 && servoArray[cmd_iterator]->paused)
 					{
 						new_servo_pos = servoArray[cmd_iterator]->position + 1;
 						set_pwm(servoArray[cmd_iterator], new_servo_pos);
 					}
 					break;
 				case 'n':
-					printf("user chose no-op\n");
 					//do nothing
 					break;
 				case 'b':
-					printf("user restarted recipe\n");
-					// recipe pointer goes back to 0
+					pthread_mutex_lock(&servoArray[cmd_iterator]->cursor_mutex);
+					servoArray[cmd_iterator]->recipe_cursor = 0;
+					pthread_mutex_unlock(&servoArray[cmd_iterator]->cursor_mutex);
 					break;
 				}
 			}
@@ -257,14 +262,14 @@ void set_pwm(Servo *servo, int pos) {
 
 	num_positions_moved = abs(servo->position - pos);
 	servo->position = pos;
-	pthread_mutex_lock(&servo->wave_mutex);
+	//pthread_mutex_lock(&servo->wave_mutex);
 	servo->duty_cycle.tv_nsec = (pos * coeff) + offset;
 	servo->duty_cycle.tv_sec = 0;
 	//printf("pos is: %d, duty(ns) is: %d\n", pos, (pos * coeff) + offset);
 
 	servo->low_interval.tv_nsec = period - servo->duty_cycle.tv_nsec;
 	servo->low_interval.tv_sec = 0;
-	pthread_mutex_unlock(&servo->wave_mutex);
+	//pthread_mutex_unlock(&servo->wave_mutex);
 
 	// requirements specify to add a wait of 200ms per move in order to allow servos the time to travel
 	wait_time = 200 * num_positions_moved;
